@@ -54,6 +54,13 @@ impl<'a, T: ForeignOwnable> Kiocb<'a, T> {
         unsafe { <T as ForeignOwnable>::borrow(private) }
     }
 
+    /// Returns the current file flags, including changes made with `fcntl`.
+    pub fn flags(&self) -> u32 {
+        // Match `File::flags()`'s READ_ONCE-equivalent access.
+        // SAFETY: The kiocb keeps its file alive for the duration of this call.
+        unsafe { core::ptr::addr_of!((*(*self.as_raw()).ki_filp).f_flags).read_volatile() }
+    }
+
     /// Gets the current value of `ki_pos`.
     pub fn ki_pos(&self) -> i64 {
         // SAFETY: We have shared access to the kiocb, so we can read its `ki_pos` field.

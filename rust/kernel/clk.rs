@@ -258,6 +258,40 @@ mod common_clk {
         }
     }
 
+    /// An enabled clock whose rate cannot be changed by other clock consumers.
+    ///
+    /// This owns the clock, one enable reference, and one exclusive-rate claim.
+    /// All three are released in reverse order when the guard is dropped.
+    pub struct ExclusiveEnabledClk(Clk);
+
+    impl ExclusiveEnabledClk {
+        /// Sets and exclusively claims the rate, then enables the clock.
+        pub fn new(clk: Clk, rate: Hertz) -> Result<Self> {
+            // SAFETY: Clk owns a live clock reference. This acquires one rate
+            // claim, which is paired below on error or in Drop on success.
+            to_result(unsafe { bindings::clk_set_rate_exclusive(clk.as_raw(), rate.as_hz()) })?;
+            if let Err(err) = clk.prepare_enable() {
+                // SAFETY: Balances the successful exclusive claim above.
+                unsafe { bindings::clk_rate_exclusive_put(clk.as_raw()) };
+                return Err(err);
+            }
+            Ok(Self(clk))
+        }
+
+        /// Returns the stable clock frequency held by this guard.
+        pub fn rate(&self) -> Hertz {
+            self.0.rate()
+        }
+    }
+
+    impl Drop for ExclusiveEnabledClk {
+        fn drop(&mut self) {
+            self.0.disable_unprepare();
+            // SAFETY: Exactly one successful rate claim belongs to this guard.
+            unsafe { bindings::clk_rate_exclusive_put(self.0.as_raw()) };
+        }
+    }
+
     /// A reference-counted optional clock.
     ///
     /// A lightweight wrapper around an optional [`Clk`]. An [`OptionalClk`] represents a [`Clk`]

@@ -1,0 +1,17 @@
+What:		/dev/rust-chardev
+Date:		September 2026
+KernelVersion:	7.2 (local development patch)
+Contact:	Local RK3588 Rust driver project
+Description:
+		A development/test character device. Each open creates a private
+		4096-byte FIFO. Duplicated descriptors share the same open file.
+		Reads remove bytes; writes append bytes. Empty reads and full
+		writes block interruptibly unless O_NONBLOCK is set, in which
+		case they return EAGAIN. Transfers may be short, particularly
+		at a ring wrap or partial userspace copy. A zero-byte user-copy
+		fault returns EFAULT and preserves the FIFO. Zero-length reads
+		and writes return zero. poll/epoll report read/write readiness;
+		positioned I/O is unsupported (ESPIPE). No private ioctls exist.
+		Device permissions follow the default miscdevice policy. An
+		open file holds a module reference until final close.
+		This device is independent of the board's physical UART/RS485.

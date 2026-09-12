@@ -1,0 +1,3 @@
+# Userspace uses libc's signed c_char ABI, not the kernel's ffi::c_char.
+# Do not inherit the kernel-only CStr::as_ptr prohibition.
+disallowed-methods = []

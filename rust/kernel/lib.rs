@@ -118,6 +118,8 @@ pub mod revocable;
 pub mod safety;
 pub mod scatterlist;
 pub mod security;
+#[cfg(CONFIG_SERIAL_CORE = "y")]
+pub mod serial;
 pub mod seq_file;
 pub mod sizes;
 #[cfg(CONFIG_SOC_BUS)]

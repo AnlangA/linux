@@ -564,6 +564,12 @@
 	status = "okay";
 };
 
+&uart3 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&uart3m2_xfer>;
+	status = "okay";
+};
+
 &u2phy2 {
 	status = "okay";
 };

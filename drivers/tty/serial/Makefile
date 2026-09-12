@@ -3,6 +3,8 @@
 # Makefile for the kernel serial device drivers.
 #
 
+obj-$(CONFIG_SERIAL_RUST_DW) += rust_dw_uart.o
+
 obj-$(CONFIG_SERIAL_CORE) += serial_base.o
 serial_base-y := serial_core.o serial_base_bus.o serial_ctrl.o serial_port.o
 

@@ -85,6 +85,8 @@
 #include <linux/regulator/consumer.h>
 #include <linux/sched.h>
 #include <linux/security.h>
+#include <linux/serial_core.h>
+#include <linux/tty_flip.h>
 #include <linux/slab.h>
 #include <linux/sys_soc.h>
 #include <linux/task_work.h>
@@ -110,6 +112,14 @@
 const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;
 const size_t RUST_CONST_HELPER_ARCH_KMALLOC_MINALIGN = ARCH_KMALLOC_MINALIGN;
 const size_t RUST_CONST_HELPER_PAGE_SIZE = PAGE_SIZE;
+const __poll_t RUST_CONST_HELPER_EPOLLIN = EPOLLIN;
+const __poll_t RUST_CONST_HELPER_EPOLLRDNORM = EPOLLRDNORM;
+const __poll_t RUST_CONST_HELPER_EPOLLOUT = EPOLLOUT;
+const __poll_t RUST_CONST_HELPER_EPOLLWRNORM = EPOLLWRNORM;
+const __poll_t RUST_CONST_HELPER_EPOLLERR = EPOLLERR;
+const __poll_t RUST_CONST_HELPER_EPOLLHUP = EPOLLHUP;
+const upf_t RUST_CONST_HELPER_UPF_FIXED_PORT = UPF_FIXED_PORT;
+const upf_t RUST_CONST_HELPER_UPF_FIXED_TYPE = UPF_FIXED_TYPE;
 const gfp_t RUST_CONST_HELPER_GFP_ATOMIC = GFP_ATOMIC;
 const gfp_t RUST_CONST_HELPER_GFP_KERNEL = GFP_KERNEL;
 const gfp_t RUST_CONST_HELPER_GFP_KERNEL_ACCOUNT = GFP_KERNEL_ACCOUNT;

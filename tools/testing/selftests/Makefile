@@ -106,6 +106,7 @@ TARGETS += riscv
 TARGETS += rlimits
 TARGETS += rseq
 TARGETS += rtc
+TARGETS += rust_uart_rs485
 TARGETS += rust
 TARGETS += sched_ext
 TARGETS += seccomp

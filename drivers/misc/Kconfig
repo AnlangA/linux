@@ -1,9 +1,19 @@
 # SPDX-License-Identifier: GPL-2.0-only
+
 #
 # Misc strange devices
 #
 
 menu "Misc devices"
+
+config RUST_CHARDEV
+	tristate "Rust bounded character-device FIFO"
+	depends on RUST
+	help
+	  Register /dev/rust-chardev for character-device development and tests.
+	  Each open file owns a 4096-byte FIFO. Supports blocking/nonblocking
+	  reads and writes, poll/epoll, short copies, and interrupted waits.
+	  The module is called rust_chardev and does not access UART hardware.
 
 config SENSORS_LIS3LV02D
 	tristate

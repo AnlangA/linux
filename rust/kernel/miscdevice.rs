@@ -26,12 +26,22 @@ use crate::{
     mm::virt::VmaNew,
     prelude::*,
     seq_file::SeqFile,
+    sync::poll::PollTable,
     types::{
         ForeignOwnable,
         Opaque, //
     },
 };
 use core::marker::PhantomData;
+
+/// Readable data is available.
+pub const POLLIN: u32 = bindings::EPOLLIN | bindings::EPOLLRDNORM;
+/// The device can accept output.
+pub const POLLOUT: u32 = bindings::EPOLLOUT | bindings::EPOLLWRNORM;
+/// The device has been disconnected.
+pub const POLLHUP: u32 = bindings::EPOLLHUP;
+/// The device has an error to report.
+pub const POLLERR: u32 = bindings::EPOLLERR;
 
 /// Options for creating a misc device.
 #[derive(Copy, Clone)]
@@ -123,6 +133,12 @@ impl<T> PinnedDrop for MiscDeviceRegistration<T> {
 /// Trait implemented by the private data of an open misc device.
 #[vtable]
 pub trait MiscDevice: Sized {
+    /// Module owning the file operations, pinned while a file remains open.
+    const OWNER: &'static crate::ThisModule;
+
+    /// Whether this device is a nonseekable, position-independent byte stream.
+    const STREAM: bool = false;
+
     /// What kind of pointer should `Self` be wrapped in.
     type Ptr: ForeignOwnable + Send + Sync;
 
@@ -159,6 +175,15 @@ pub trait MiscDevice: Sized {
 
     /// Write to this miscdevice.
     fn write_iter(_kiocb: Kiocb<'_, Self::Ptr>, _iov: &mut IovIterSource<'_>) -> Result<usize> {
+        build_error!(VTABLE_DEFAULT_ERROR)
+    }
+
+    /// Registers wait queues and returns the current readiness mask.
+    fn poll(
+        _device: <Self::Ptr as ForeignOwnable>::Borrowed<'_>,
+        _file: &File,
+        _table: &PollTable<'_>,
+    ) -> u32 {
         build_error!(VTABLE_DEFAULT_ERROR)
     }
 
@@ -213,7 +238,13 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
     /// The file must be associated with a `MiscDeviceRegistration<T>`.
     unsafe extern "C" fn open(inode: *mut bindings::inode, raw_file: *mut bindings::file) -> c_int {
         // SAFETY: The pointers are valid and for a file being opened.
-        let ret = unsafe { bindings::generic_file_open(inode, raw_file) };
+        let ret = unsafe {
+            if T::STREAM {
+                bindings::stream_open(inode, raw_file)
+            } else {
+                bindings::generic_file_open(inode, raw_file)
+            }
+        };
         if ret != 0 {
             return ret;
         }
@@ -398,7 +429,28 @@ impl<T: MiscDevice> MiscdeviceVTable<T> {
         T::show_fdinfo(device, m, file);
     }
 
+    /// # Safety
+    ///
+    /// `raw_file` must be a live file opened by this vtable. `table` must be
+    /// null or a valid poll table for the duration of the callback.
+    unsafe extern "C" fn poll(
+        raw_file: *mut bindings::file,
+        table: *mut bindings::poll_table,
+    ) -> u32 {
+        // SAFETY: VFS calls this only for a live file opened by Self::open().
+        let private = unsafe { (*raw_file).private_data };
+        // SAFETY: The private pointer remains owned by this file until release().
+        let device = unsafe { <T::Ptr as ForeignOwnable>::borrow(private) };
+        // SAFETY: The callback provides a live file; no fdget_pos region is active here.
+        let file = unsafe { File::from_raw_file(raw_file) };
+        // SAFETY: VFS supplies a null or valid poll table for the callback duration.
+        let table = unsafe { PollTable::from_raw(table) };
+        T::poll(device, file, &table)
+    }
+
     const VTABLE: bindings::file_operations = bindings::file_operations {
+        owner: T::OWNER.as_ptr(),
+        poll: if T::HAS_POLL { Some(Self::poll) } else { None },
         open: Some(Self::open),
         release: Some(Self::release),
         mmap: if T::HAS_MMAP { Some(Self::mmap) } else { None },

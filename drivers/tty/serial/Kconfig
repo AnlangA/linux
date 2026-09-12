@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0
+
 #
 # Serial device configuration
 #
@@ -17,6 +18,16 @@ config SERIAL_EARLYCON
 source "drivers/tty/serial/8250/Kconfig"
 
 comment "Non-8250 serial port support"
+
+config SERIAL_RUST_DW
+	tristate "Rust RK3588 DesignWare UART controller"
+	depends on RUST && ARM64 && ARCH_ROCKCHIP && COMMON_CLK
+	depends on SERIAL_CORE=y
+	help
+	  Interrupt-driven UART controller written in Rust. Uses serial core to
+	  expose /dev/ttyRU0. Intended for development on a non-console RK3588
+	  UART selected explicitly through driver_override. One port per module;
+	  no console, DMA, modem flow control, or suspend support.
 
 config SERIAL_AMBA_PL010
 	tristate "ARM AMBA PL010 serial port support"

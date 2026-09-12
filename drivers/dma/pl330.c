@@ -2317,6 +2317,14 @@ static int pl330_terminate_all(struct dma_chan *chan)
 	return 0;
 }
 
+static void pl330_synchronize(struct dma_chan *chan)
+{
+	struct dma_pl330_chan *pch = to_pchan(chan);
+
+	/* terminate_all stops hardware; callbacks run outside pch->lock. */
+	tasklet_kill(&pch->task);
+}
+
 /*
  * We don't support DMA_RESUME command because of hardware
  * limitations, so after pausing the channel we cannot restore
@@ -3131,6 +3139,7 @@ pl330_probe(struct amba_device *adev, const struct amba_id *id)
 	pd->device_config = pl330_config;
 	pd->device_pause = pl330_pause;
 	pd->device_terminate_all = pl330_terminate_all;
+	pd->device_synchronize = pl330_synchronize;
 	pd->device_issue_pending = pl330_issue_pending;
 	pd->src_addr_widths = PL330_DMA_BUSWIDTHS;
 	pd->dst_addr_widths = PL330_DMA_BUSWIDTHS;

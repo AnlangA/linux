@@ -1,5 +1,4 @@
 # SPDX-License-Identifier: GPL-2.0
-
 #
 # Serial device configuration
 #
@@ -25,8 +24,8 @@ config SERIAL_RUST_DW
 	depends on SERIAL_CORE=y
 	help
 	  Interrupt-driven UART controller written in Rust. Uses serial core to
-	  expose /dev/ttyRU0. Intended for development on a non-console RK3588
-	  UART selected explicitly through driver_override. One port per module;
+	  expose /dev/ttyRU<n>, one line per bound UART. Intended for development
+	  on non-console RK3588 UARTs selected explicitly through driver_override;
 	  no console, DMA, modem flow control, or suspend support.
 
 config SERIAL_AMBA_PL010

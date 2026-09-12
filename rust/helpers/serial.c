@@ -6,19 +6,19 @@
 
 /* Only inline/macro adapters; controller logic lives in Rust. */
 __rust_helper void rust_helper_uart_port_lock_irqsave(struct uart_port *port,
-						    unsigned long *flags)
+						      unsigned long *flags)
 {
 	uart_port_lock_irqsave(port, flags);
 }
 
 __rust_helper void rust_helper_uart_port_unlock_irqrestore(struct uart_port *port,
-							 unsigned long flags)
+							   unsigned long flags)
 {
 	uart_port_unlock_irqrestore(port, flags);
 }
 
 __rust_helper unsigned int rust_helper_uart_fifo_get(struct uart_port *port,
-						   unsigned char *ch)
+						     unsigned char *ch)
 {
 	return uart_fifo_get(port, ch);
 }

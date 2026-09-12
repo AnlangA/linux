@@ -2,9 +2,13 @@
 
 //! Minimal interrupt-driven UART integration with serial core.
 //!
-//! A registration owns one TTY line and revokes all callbacks before its
-//! hardware resources are dropped. The abstraction deliberately exposes no
-//! raw uart_port pointer to controller drivers.
+//! A [`Driver`] is a module-lifetime `uart_driver`: it owns the TTY major and
+//! the per-line state that open TTYs keep referring to until they are closed.
+//! A [`Port`] is one device-lifetime line on such a driver. The split follows
+//! serial core's ownership rules: unbinding a device only hangs its line up,
+//! while an open TTY pins the module so the line state cannot be freed under
+//! it. The abstraction deliberately exposes no raw `uart_port` pointer to
+//! controller drivers.
 
 use crate::{
     bindings,
@@ -15,6 +19,13 @@ use crate::{
     error::to_result,
     irq::IrqRequest,
     prelude::*,
+    sync::atomic::{
+        Acquire,
+        Atomic,
+        Full,
+        Relaxed,
+        Release, //
+    },
     types::Opaque,
     ThisModule, //
 };
@@ -41,7 +52,7 @@ pub mod receive {
 pub struct LineConfig {
     /// Requested baud rate selected by serial core.
     pub baud: u32,
-    /// Stable input clock rate in Hz.
+    /// Input clock rate in Hz, as returned by [`Hardware::prepare_clock`].
     pub clock: u32,
     /// Five, six, seven, or eight data bits.
     pub data_bits: u8,
@@ -53,7 +64,7 @@ pub struct LineConfig {
     pub odd_parity: bool,
 }
 
-/// Controller operations, always called with the UART spinlock held.
+/// Controller operations, called with the UART spinlock held unless noted.
 ///
 /// Methods must not sleep. IRQ service must have a bounded work budget.
 pub trait Hardware: Send + Sync {
@@ -75,6 +86,15 @@ pub trait Hardware: Send + Sync {
     fn stop_rx(&self);
     /// Sets or clears break.
     fn set_break(&self, enable: bool);
+    /// Prepares the input clock for `baud` and returns the rate it then runs at.
+    ///
+    /// Unlike the other methods this is called in process context without the
+    /// port lock and may sleep. `clock` is the rate currently recorded for the
+    /// port; controllers with a fixed clock return it unchanged.
+    fn prepare_clock(&self, baud: u32, clock: u32) -> u32 {
+        let _ = baud;
+        clock
+    }
     /// Configures framing/divisor, or leaves the previous configuration intact.
     fn configure(&self, config: LineConfig) -> Result<u32>;
     /// Services a UART interrupt and reports whether this UART caused it.
@@ -157,113 +177,275 @@ impl LockedPort<'_> {
     }
 }
 
-/// One TTY line with dynamically allocated device numbers.
+/// Static description of a TTY driver.
+pub struct DriverInfo {
+    /// Name shown under `/proc/tty/driver/`.
+    pub driver_name: &'static CStr,
+    /// Device node prefix; line `n` becomes `/dev/<dev_name><n>`.
+    pub dev_name: &'static CStr,
+    /// Number of lines, at most [`Driver::MAX_LINES`].
+    pub lines: u32,
+}
+
+/// A `uart_driver` meant to live in a `static` for the module's lifetime.
+///
+/// Register it once from module initialization with [`Driver::register`] and
+/// keep the returned [`Registration`] alive for as long as any [`Port`] on
+/// this driver can exist. Declare the device driver registration *before*
+/// the [`Registration`] in the module struct so that devices are unbound,
+/// and their ports removed, before the TTY driver goes away.
 ///
 /// # Invariants
 ///
-/// Both the UART driver and port are registered and pinned. `hardware` and
-/// the parent device outlive all callbacks; removal stops IRQs synchronously.
+/// `raw` is only written by the holder of the [`Self::REGISTERING`] state.
+/// While `state` is [`Self::REGISTERED`], `raw` is registered with serial
+/// core and the TTY driver's owner is the module that created the ports.
+pub struct Driver {
+    raw: Opaque<bindings::uart_driver>,
+    info: DriverInfo,
+    /// Bit `n` is set while line `n` belongs to a [`Port`].
+    lines: Atomic<u64>,
+    /// One of [`Self::UNREGISTERED`], [`Self::REGISTERING`] or [`Self::REGISTERED`].
+    state: Atomic<u32>,
+}
+
+// SAFETY: `raw` is only mutated by `register()` and `Registration::drop()`,
+// which are serialized through `state`; every other access is a shared read
+// of a driver that stays registered while it is used.
+unsafe impl Sync for Driver {}
+
+impl Driver {
+    /// Largest supported line count; one bit of `lines` per line.
+    pub const MAX_LINES: u32 = 64;
+
+    const UNREGISTERED: u32 = 0;
+    const REGISTERING: u32 = 1;
+    const REGISTERED: u32 = 2;
+
+    /// Creates an unregistered driver.
+    pub const fn new(info: DriverInfo) -> Self {
+        Self {
+            raw: Opaque::zeroed(),
+            info,
+            lines: Atomic::new(0),
+            state: Atomic::new(Self::UNREGISTERED),
+        }
+    }
+
+    /// Registers the driver with serial core on behalf of `module`.
+    ///
+    /// An open TTY on any of its lines holds a reference to `module`, so the
+    /// module cannot be removed while line state is still reachable.
+    pub fn register(&'static self, module: &'static ThisModule) -> Result<Registration> {
+        if self.info.lines == 0 || self.info.lines > Self::MAX_LINES {
+            return Err(EINVAL);
+        }
+        if self
+            .state
+            .cmpxchg(Self::UNREGISTERED, Self::REGISTERING, Full)
+            .is_err()
+        {
+            return Err(EBUSY);
+        }
+        let raw = self.raw.get();
+        // SAFETY: This thread holds the `REGISTERING` state, so nothing else
+        // accesses `raw`; the names have static lifetime.
+        unsafe {
+            raw.write(pin_init::zeroed());
+            (*raw).owner = module.as_ptr();
+            (*raw).driver_name = self.info.driver_name.as_char_ptr();
+            (*raw).dev_name = self.info.dev_name.as_char_ptr();
+            (*raw).nr = self.info.lines as i32;
+        }
+        // SAFETY: `raw` is initialized and, living in a `static`, stays pinned.
+        if let Err(err) = to_result(unsafe { bindings::uart_register_driver(raw) }) {
+            self.state.store(Self::UNREGISTERED, Release);
+            return Err(err);
+        }
+        // SAFETY: Registration created `tty_driver`; no line can be opened
+        // before a `Port` is added, so nothing observes the owner changing.
+        unsafe { (*(*raw).tty_driver).owner = module.as_ptr() };
+        self.state.store(Self::REGISTERED, Release);
+        Ok(Registration { driver: self })
+    }
+
+    /// The static description this driver was created with.
+    pub fn info(&self) -> &DriverInfo {
+        &self.info
+    }
+}
+
+/// Keeps a [`Driver`] registered; unregisters it when dropped.
+pub struct Registration {
+    driver: &'static Driver,
+}
+
+impl Registration {
+    /// The registered driver.
+    pub fn driver(&self) -> &'static Driver {
+        self.driver
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        // Ports are removed by their device drivers, which must be torn down
+        // first. Leaking the registration is the only memory-safe response if
+        // a module got that order wrong: serial core would free line state
+        // that live ports still use.
+        if self.driver.lines.load(Acquire) != 0 {
+            pr_err!(
+                "{}: lines still in use at unregistration; leaking the TTY driver\n",
+                self.driver.info.driver_name
+            );
+            return;
+        }
+        // SAFETY: `register()` succeeded and no `Port` refers to this driver.
+        unsafe { bindings::uart_unregister_driver(self.driver.raw.get()) };
+        self.driver.state.store(Driver::UNREGISTERED, Release);
+    }
+}
+
+/// Ownership of one line index of a [`Driver`].
+struct Line {
+    driver: &'static Driver,
+    index: u32,
+}
+
+impl Line {
+    fn allocate(driver: &'static Driver) -> Result<Self> {
+        let mut used = driver.lines.load(Relaxed);
+        loop {
+            let index = (!used).trailing_zeros();
+            if index >= driver.info.lines {
+                return Err(EBUSY);
+            }
+            match driver.lines.cmpxchg(used, used | (1 << index), Full) {
+                Ok(_) => return Ok(Self { driver, index }),
+                Err(current) => used = current,
+            }
+        }
+    }
+}
+
+impl Drop for Line {
+    fn drop(&mut self) {
+        let mut used = self.driver.lines.load(Relaxed);
+        while let Err(current) = self
+            .driver
+            .lines
+            .cmpxchg(used, used & !(1u64 << self.index), Full)
+        {
+            used = current;
+        }
+    }
+}
+
+/// One TTY line of a registered [`Driver`], tied to a bound device.
+///
+/// # Invariants
+///
+/// While `added` is set the port is registered with serial core and
+/// `raw.private_data` points at `hardware`. `hardware` and the parent device
+/// outlive all callbacks; removal stops IRQs synchronously.
 #[pin_data(PinnedDrop)]
-pub struct Registration<'a, T: Hardware> {
+pub struct Port<'a, T: Hardware> {
+    #[pin]
     hardware: T,
+    line: Line,
     #[pin]
-    driver: Opaque<bindings::uart_driver>,
-    #[pin]
-    port: Opaque<bindings::uart_port>,
+    raw: Opaque<bindings::uart_port>,
     _device: PhantomData<&'a Device<Bound>>,
-    registered: bool,
+    added: bool,
 }
 
 // SAFETY: Hardware is Send + Sync. All mutable uart_port accesses are protected
 // by the serial-core port lock or serialized startup/shutdown/core lifecycle.
-unsafe impl<T: Hardware> Send for Registration<'_, T> {}
+unsafe impl<T: Hardware> Send for Port<'_, T> {}
 // SAFETY: The same UART lock serializes concurrent callbacks.
-unsafe impl<T: Hardware> Sync for Registration<'_, T> {}
+unsafe impl<T: Hardware> Sync for Port<'_, T> {}
 
-impl<'a, T: Hardware + 'a> Registration<'a, T> {
-    /// Registers a single-line controller as `/dev/ttyRU0`.
+impl<'a, T: Hardware + 'a> Port<'a, T> {
+    /// Adds the lowest free line of `driver` for `dev`.
     ///
     /// The caller must supply MMIO obtained from this device, with interrupt
-    /// sources disabled. Only one registration may own this TTY driver name.
+    /// sources disabled. `driver` must currently be registered, and its
+    /// [`Registration`] must outlive the returned port.
     pub fn new(
+        driver: &'static Driver,
         dev: &'a Device<Bound>,
         irq: IrqRequest<'a>,
         hardware: T,
         mapbase: u64,
         clock: u32,
         fifo_size: u32,
-        module: &'static ThisModule,
     ) -> impl PinInit<Self, Error> + 'a {
-        try_pin_init!(&this in Self {
-            hardware: hardware,
-            driver <- Opaque::try_ffi_init(|slot: *mut bindings::uart_driver| {
-                // SAFETY: The initializer exclusively owns this uninitialized slot.
-                unsafe {
-                    slot.write(pin_init::zeroed());
-                    (*slot).owner = module.as_ptr();
-                    (*slot).driver_name = c"rust_dw_uart".as_char_ptr();
-                    (*slot).dev_name = c"ttyRU".as_char_ptr();
-                    (*slot).nr = 1;
-                }
-                Ok::<(), Error>(())
-            }),
-            port <- Opaque::try_ffi_init(|slot: *mut bindings::uart_port| {
-                // SAFETY: The initializer owns the slot; all stored addresses
-                // stay valid until uart_remove_one_port() completes in Drop.
-                unsafe {
-                    slot.write(pin_init::zeroed());
-                    bindings::__spin_lock_init(
-                        ptr::addr_of_mut!((*slot).lock),
-                        c"rust-uart-port".as_char_ptr(),
-                        crate::static_lock_class!().as_ptr(),
-                    );
-                    (*slot).dev = dev.as_raw();
-                    (*slot).irq = irq.irq();
-                    (*slot).mapbase = mapbase;
-                    (*slot).uartclk = clock;
-                    (*slot).fifosize = fifo_size;
-                    (*slot).iotype = bindings::uart_iotype_UPIO_MEM32;
-                    (*slot).regshift = 2;
-                    (*slot).type_ = bindings::PORT_16550A;
-                    (*slot).flags = bindings::UPF_FIXED_PORT | bindings::UPF_FIXED_TYPE;
-                    (*slot).ops = &Self::OPS;
-                    (*slot).private_data = this.as_ptr().cast();
-                }
-                Ok::<(), Error>(())
-            }),
-            _device: PhantomData,
-            registered: {
-                // SAFETY: The two opaque fields and hardware were initialized
-                // above. No callback reads the final `registered` field.
-                let (driver, port) = unsafe {
-                    ((*this.as_ptr()).driver.get(), (*this.as_ptr()).port.get())
-                };
-                // SAFETY: The initialized UART driver remains pinned until Drop.
-                to_result(unsafe { bindings::uart_register_driver(driver) })?;
-                // SAFETY: All callbacks and hardware are initialized and live.
-                let result = unsafe { bindings::uart_add_one_port(driver, port) };
-                if result < 0 {
-                    // SAFETY: Balances the successful registration above.
-                    unsafe { bindings::uart_unregister_driver(driver) };
-                    return Err(Error::from_errno(result));
-                }
-                true
-            },
+        pin_init::pin_init_scope(move || {
+            if driver.state.load(Acquire) != Driver::REGISTERED {
+                return Err(ENODEV);
+            }
+            let line = Line::allocate(driver)?;
+            let index = line.index;
+            Ok(try_pin_init!(&this in Self {
+                hardware,
+                line,
+                raw <- Opaque::try_ffi_init(|slot: *mut bindings::uart_port| {
+                    // SAFETY: The initializer owns the slot. `hardware` was
+                    // initialized above and, like every other stored address,
+                    // stays valid until uart_remove_one_port() completes in Drop.
+                    unsafe {
+                        slot.write(pin_init::zeroed());
+                        bindings::__spin_lock_init(
+                            ptr::addr_of_mut!((*slot).lock),
+                            c"rust-uart-port".as_char_ptr(),
+                            crate::static_lock_class!().as_ptr(),
+                        );
+                        (*slot).dev = dev.as_raw();
+                        (*slot).irq = irq.irq();
+                        (*slot).line = index;
+                        (*slot).mapbase = mapbase;
+                        (*slot).uartclk = clock;
+                        (*slot).fifosize = fifo_size;
+                        (*slot).iotype = bindings::uart_iotype_UPIO_MEM32;
+                        (*slot).regshift = 2;
+                        (*slot).type_ = bindings::PORT_16550A;
+                        (*slot).flags = bindings::UPF_FIXED_PORT | bindings::UPF_FIXED_TYPE;
+                        (*slot).ops = &Self::OPS;
+                        (*slot).private_data =
+                            ptr::addr_of!((*this.as_ptr()).hardware).cast_mut().cast();
+                    }
+                    Ok::<(), Error>(())
+                }),
+                _device: PhantomData,
+                added: {
+                    // SAFETY: `raw` was initialized above; callbacks only reach
+                    // `hardware`, which is initialized and pinned as well.
+                    let raw = unsafe { (*this.as_ptr()).raw.get() };
+                    // SAFETY: The driver is registered and outlives this port.
+                    to_result(unsafe { bindings::uart_add_one_port(driver.raw.get(), raw) })?;
+                    true
+                },
+            }))
         })
+    }
+
+    /// The line index; the device node is `/dev/<dev_name><line>`.
+    pub fn line(&self) -> u32 {
+        self.line.index
     }
 
     /// # Safety
     ///
-    /// `port` must belong to this exact registration type, and the registration
-    /// must remain alive for the entire returned borrow `'b`.
-    unsafe fn from_port<'b>(port: *mut bindings::uart_port) -> &'b Self {
-        // SAFETY: Called only with a registered port owned by this instantiation.
-        unsafe { &*(*port).private_data.cast::<Self>() }
+    /// `port` must have been created by [`Port::new`] with this `T`, and that
+    /// port must stay registered for the entire returned borrow `'b`.
+    unsafe fn hardware<'b>(port: *mut bindings::uart_port) -> &'b T {
+        // SAFETY: `private_data` points at the pinned `hardware` of a live port.
+        unsafe { &*(*port).private_data.cast::<T>() }
     }
 
     fn locked<R>(port: *mut bindings::uart_port, f: impl FnOnce(&mut LockedPort<'_>) -> R) -> R {
         let mut flags = 0;
-        // SAFETY: All callers pass a live port owned by this registration.
+        // SAFETY: All callers pass a live port created by `Port::new`.
         unsafe { bindings::uart_port_lock_irqsave(port, &mut flags) };
         let result = f(&mut LockedPort {
             raw: port,
@@ -276,12 +458,12 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
 
     /// # Safety
     ///
-    /// `port` must belong to a live registration; its lock must not be held.
+    /// `port` must belong to a live port; its lock must not be held.
     unsafe extern "C" fn tx_empty(port: *mut bindings::uart_port) -> u32 {
         // SAFETY: serial core only invokes callbacks while the port is registered.
-        let this = unsafe { Self::from_port(port) };
+        let hardware = unsafe { Self::hardware(port) };
         Self::locked(port, |_| {
-            if this.hardware.tx_empty() {
+            if hardware.tx_empty() {
                 bindings::TIOCSER_TEMT
             } else {
                 0
@@ -291,12 +473,10 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
 
     /// # Safety
     ///
-    /// `port` must belong to a live registration and its IRQ-safe lock is held.
+    /// `port` must belong to a live port and its IRQ-safe lock is held.
     unsafe extern "C" fn set_mctrl(port: *mut bindings::uart_port, ctrl: u32) {
         // SAFETY: serial core calls this with the port lock held.
-        unsafe { Self::from_port(port) }
-            .hardware
-            .set_loopback(ctrl & bindings::TIOCM_LOOP != 0);
+        unsafe { Self::hardware(port) }.set_loopback(ctrl & bindings::TIOCM_LOOP != 0);
     }
 
     extern "C" fn get_mctrl(_port: *mut bindings::uart_port) -> u32 {
@@ -309,36 +489,34 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
     /// `port` and its transmit state are live and its IRQ-safe lock is held.
     unsafe extern "C" fn start_tx(port: *mut bindings::uart_port) {
         // SAFETY: serial core supplies its lock and live state for start_tx.
-        unsafe { Self::from_port(port) }
-            .hardware
-            .start_tx(&mut LockedPort {
-                raw: port,
-                _lifetime: PhantomData,
-            });
+        unsafe { Self::hardware(port) }.start_tx(&mut LockedPort {
+            raw: port,
+            _lifetime: PhantomData,
+        });
     }
 
     /// # Safety
     ///
-    /// `port` belongs to a live registration and its IRQ-safe lock is held.
+    /// `port` belongs to a live port and its IRQ-safe lock is held.
     unsafe extern "C" fn stop_tx(port: *mut bindings::uart_port) {
         // SAFETY: serial core supplies the port lock.
-        unsafe { Self::from_port(port) }.hardware.stop_tx();
+        unsafe { Self::hardware(port) }.stop_tx();
     }
 
     /// # Safety
     ///
-    /// `port` belongs to a live registration and its IRQ-safe lock is held.
+    /// `port` belongs to a live port and its IRQ-safe lock is held.
     unsafe extern "C" fn flush_buffer(port: *mut bindings::uart_port) {
         // SAFETY: Serial core invokes this with the live port locked.
-        unsafe { Self::from_port(port) }.hardware.flush_tx();
+        unsafe { Self::hardware(port) }.flush_tx();
     }
 
     /// # Safety
     ///
-    /// `port` belongs to a live registration and its IRQ-safe lock is held.
+    /// `port` belongs to a live port and its IRQ-safe lock is held.
     unsafe extern "C" fn stop_rx(port: *mut bindings::uart_port) {
         // SAFETY: serial core supplies the port lock.
-        unsafe { Self::from_port(port) }.hardware.stop_rx();
+        unsafe { Self::hardware(port) }.stop_rx();
     }
 
     /// # Safety
@@ -346,8 +524,8 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
     /// `port` is live, its TTY mutex is held, and its spinlock is not held.
     unsafe extern "C" fn break_ctl(port: *mut bindings::uart_port, enabled: i32) {
         // SAFETY: The registered port stays alive during this callback.
-        let this = unsafe { Self::from_port(port) };
-        Self::locked(port, |_| this.hardware.set_break(enabled != 0));
+        let hardware = unsafe { Self::hardware(port) };
+        Self::locked(port, |_| hardware.set_break(enabled != 0));
     }
 
     /// # Safety
@@ -356,22 +534,23 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
     /// shutdown and calls it only while no IRQ is registered for this port.
     unsafe extern "C" fn startup(port: *mut bindings::uart_port) -> i32 {
         // SAFETY: serial core serializes startup and shutdown; state is live.
-        let this = unsafe { Self::from_port(port) };
-        // SAFETY: The port and callback cookie remain live until shutdown's
-        // free_irq() synchronizes the handler. Hardware IRQ sources are masked.
+        let hardware = unsafe { Self::hardware(port) };
+        // SAFETY: The port, its serial-core allocated name and the callback
+        // cookie remain live until shutdown's free_irq() synchronizes the
+        // handler. Hardware IRQ sources are masked.
         let result = unsafe {
             bindings::request_irq(
                 (*port).irq,
                 Some(Self::interrupt),
                 0,
-                c"rust_dw_uart".as_char_ptr(),
+                (*port).name,
                 port.cast(),
             )
         };
         if result < 0 {
             return result;
         }
-        if let Err(err) = Self::locked(port, |_| this.hardware.startup()) {
+        if let Err(err) = Self::locked(port, |_| hardware.startup()) {
             // SAFETY: Balances request_irq; startup has not been published.
             unsafe { bindings::free_irq((*port).irq, port.cast()) };
             return err.to_errno();
@@ -385,8 +564,8 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
     /// hardware must remain alive until this synchronous shutdown completes.
     unsafe extern "C" fn shutdown(port: *mut bindings::uart_port) {
         // SAFETY: serial core invokes shutdown once for each successful startup.
-        let this = unsafe { Self::from_port(port) };
-        Self::locked(port, |_| this.hardware.shutdown());
+        let hardware = unsafe { Self::hardware(port) };
+        Self::locked(port, |_| hardware.shutdown());
         // SAFETY: Hardware sources are now masked. free_irq waits for an in-flight
         // handler before serial core is allowed to destroy the port state.
         unsafe { bindings::free_irq((*port).irq, port.cast()) };
@@ -398,8 +577,8 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
     unsafe extern "C" fn interrupt(_irq: i32, cookie: *mut c_void) -> bindings::irqreturn_t {
         let port = cookie.cast::<bindings::uart_port>();
         // SAFETY: request_irq/free_irq bound this cookie's lifetime to live state.
-        let this = unsafe { Self::from_port(port) };
-        if Self::locked(port, |locked| this.hardware.interrupt(locked)) {
+        let hardware = unsafe { Self::hardware(port) };
+        if Self::locked(port, |locked| hardware.interrupt(locked)) {
             bindings::irqreturn_IRQ_HANDLED
         } else {
             bindings::irqreturn_IRQ_NONE
@@ -418,9 +597,16 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
         // SAFETY: serial core provides valid termios pointers (old may be null)
         // and serializes termios changes. All port data is accessed under lock.
         unsafe {
-            let this = Self::from_port(port);
+            let hardware = Self::hardware(port);
             (*new).c_cflag &= !(bindings::CRTSCTS | bindings::CMSPAR);
-            let clock = (*port).uartclk;
+            // Let the controller pick an input clock for the requested rate
+            // before serial core clamps the rate to what that clock can divide.
+            // B0 hangs up and is treated as 9600 by serial core.
+            let requested = match bindings::tty_termios_baud_rate(new) {
+                0 => 9600,
+                rate => rate,
+            };
+            let mut clock = hardware.prepare_clock(requested, (*port).uartclk);
             let baud = bindings::uart_get_baud_rate(
                 port,
                 new,
@@ -428,6 +614,9 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
                 (clock / 16 / 65535).max(50),
                 clock / 16,
             );
+            if baud != requested {
+                clock = hardware.prepare_clock(baud, clock);
+            }
             let cflag = (*new).c_cflag;
             let iflag = (*new).c_iflag;
             let config = LineConfig {
@@ -443,16 +632,12 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
                 parity: cflag & bindings::PARENB != 0,
                 odd_parity: cflag & bindings::PARODD != 0,
             };
-            Self::locked(port, |_| {
-                let actual = match this.hardware.configure(config) {
+            let applied = Self::locked(port, |_| {
+                let actual = match hardware.configure(config) {
                     Ok(rate) if rate != 0 => rate,
-                    _ => {
-                        if !old.is_null() {
-                            *new = *old;
-                        }
-                        return;
-                    }
+                    _ => return false,
                 };
+                (*port).uartclk = clock;
                 (*port).read_status_mask = receive::OVERRUN | receive::DATA;
                 if iflag & bindings::INPCK != 0 {
                     (*port).read_status_mask |= receive::PARITY | receive::FRAME;
@@ -477,7 +662,33 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
                 if (*new).c_ospeed != 0 {
                     bindings::tty_termios_encode_baud_rate(new, actual, actual);
                 }
+                true
             });
+            if applied {
+                return;
+            }
+            let dev: &Device = Device::from_raw((*port).dev);
+            if old.is_null() {
+                dev_warn!(
+                    dev,
+                    "{} baud not applied; the line keeps its previous settings\n",
+                    baud
+                );
+                return;
+            }
+            // Report the previous settings and move the clock back to them.
+            *new = *old;
+            let previous = match bindings::tty_termios_baud_rate(old) {
+                0 => 9600,
+                rate => rate,
+            };
+            if hardware.prepare_clock(previous, clock) != (*port).uartclk {
+                dev_warn!(
+                    dev,
+                    "{} baud not applied and the input clock could not be restored\n",
+                    baud
+                );
+            }
         }
     }
 
@@ -518,15 +729,13 @@ impl<'a, T: Hardware + 'a> Registration<'a, T> {
 }
 
 #[pinned_drop]
-impl<T: Hardware> PinnedDrop for Registration<'_, T> {
+impl<T: Hardware> PinnedDrop for Port<'_, T> {
     fn drop(self: Pin<&mut Self>) {
-        if self.registered {
-            // SAFETY: Both objects were registered by new(). Removing the port
-            // hangs up users and synchronizes shutdown/IRQ before hardware drops.
-            unsafe {
-                bindings::uart_remove_one_port(self.driver.get(), self.port.get());
-                bindings::uart_unregister_driver(self.driver.get());
-            }
+        if self.added {
+            // SAFETY: `new()` added this port to `line.driver`, which stays
+            // registered while the port exists. Removal hangs up users and
+            // synchronizes shutdown/IRQ handling before `hardware` drops.
+            unsafe { bindings::uart_remove_one_port(self.line.driver.raw.get(), self.raw.get()) };
         }
     }
 }

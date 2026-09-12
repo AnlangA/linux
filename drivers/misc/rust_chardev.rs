@@ -101,11 +101,9 @@ impl MiscDevice for OpenFile {
         }
         let this = kiocb.file();
         let nonblocking = kiocb.flags() & O_NONBLOCK != 0;
-        let mut buffer = if nonblocking {
-            this.buffer.try_lock().ok_or(EAGAIN)?
-        } else {
-            this.buffer.lock()
-        };
+        // The mutex is only held for short copies, so waiting for it does not
+        // block in the O_NONBLOCK sense; only an empty FIFO does.
+        let mut buffer = this.buffer.lock();
         while buffer.ring.is_empty() {
             if nonblocking {
                 return Err(EAGAIN);
@@ -132,11 +130,7 @@ impl MiscDevice for OpenFile {
         }
         let this = kiocb.file();
         let nonblocking = kiocb.flags() & O_NONBLOCK != 0;
-        let mut buffer = if nonblocking {
-            this.buffer.try_lock().ok_or(EAGAIN)?
-        } else {
-            this.buffer.lock()
-        };
+        let mut buffer = this.buffer.lock();
         while buffer.ring.is_full() {
             if nonblocking {
                 return Err(EAGAIN);

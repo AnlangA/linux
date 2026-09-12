@@ -4,6 +4,10 @@
 //!
 //! Bind explicitly using driver_override. There is intentionally no automatic
 //! OF match table: loading this development driver must not capture a console.
+//!
+//! The TTY driver (`/dev/ttyRU*`) lives for the module's lifetime; each bound
+//! UART adds one line. Unbinding a device hangs its line up, while an open
+//! line keeps the module loaded.
 
 use kernel::{
     clk::{
@@ -12,6 +16,7 @@ use kernel::{
         Hertz, //
     },
     device::Core,
+    driver,
     io::{
         mem::IoMem,
         Io, //
@@ -24,16 +29,44 @@ use kernel::{
         LineConfig,
         LockedPort, //
     },
+    sync::atomic::{
+        Atomic,
+        Relaxed, //
+    },
 };
 
 #[path = "rust_dw_uart/config.rs"]
 mod config;
 
+/// RK3588 has UART0 to UART9.
+const LINES: u32 = 10;
+/// The fixed 24 MHz reference every standard rate up to 1.5 Mbaud divides from.
+const REFERENCE_RATE: u32 = 24_000_000;
 const FIFO_SIZE: u32 = 64;
 const IRQ_BUDGET: usize = 256;
 const IER_RX: u32 = 1;
 const IER_TX: u32 = 2;
 const IER_LSR: u32 = 4;
+/// FIFOs enabled with the receive trigger at a quarter depth; DesignWare's
+/// four-character timeout interrupt still delivers shorter messages promptly.
+const FCR_ENABLE: u32 = 0x41;
+const FCR_RESET_ALL: u32 = FCR_ENABLE | 0x06;
+const FCR_RESET_TX: u32 = FCR_ENABLE | 0x04;
+/// LSR overrun, parity, framing and break bits.
+const LSR_ERRORS: u32 = 0x1e;
+/// LSR data-ready and break bits.
+const LSR_DATA: u32 = 0x11;
+
+static TTY_DRIVER: serial::Driver = serial::Driver::new(serial::DriverInfo {
+    driver_name: c"rust_dw_uart",
+    dev_name: c"ttyRU",
+    lines: LINES,
+});
+
+/// Widens a register-sized rate; the driver is ARM64-only, so this never saturates.
+fn hertz(rate: u32) -> Hertz {
+    Hertz(c_ulong::try_from(rate).unwrap_or(c_ulong::MAX))
+}
 
 /// A clock kept enabled for the entire period that registers can be accessed.
 struct EnabledClock(Clk);
@@ -55,8 +88,13 @@ impl Drop for EnabledClock {
 struct DwUart<'a> {
     io: IoMem<'a, 0x100>,
     dlf_bits: u8,
+    fifo_size: u32,
+    /// LSR error bits describe the FIFO head and clear on read. Reads outside
+    /// the receive path park them here so no error is lost (8250's
+    /// `lsr_saved_flags`). Only touched under the port lock.
+    saved_lsr: Atomic<u32>,
     // The APB clock outlives baud-clock teardown; both outlive all callbacks.
-    _baud_clock: ExclusiveEnabledClk,
+    baud_clock: ExclusiveEnabledClk,
     _bus_clock: EnabledClock,
 }
 
@@ -70,8 +108,13 @@ impl DwUart<'_> {
     fn lcr(&self) -> u32 {
         self.io.read32(0x0c)
     }
+
+    /// Reads LSR outside the receive path, keeping error bits for it.
     fn lsr(&self) -> u32 {
-        self.io.read32(0x14)
+        let lsr = self.io.read32(0x14);
+        self.saved_lsr
+            .store(self.saved_lsr.load(Relaxed) | (lsr & LSR_ERRORS), Relaxed);
+        lsr
     }
 
     /// DesignWare may reject LCR writes while busy. Match the established
@@ -83,7 +126,7 @@ impl DwUart<'_> {
                 return Ok(());
             }
             let _ = self.io.read32(0x7c); // Clear busy-detect interrupt.
-            self.io.write32(0x07, 0x08); // Enable and clear both FIFOs.
+            self.io.write32(FCR_RESET_ALL, 0x08);
             let _ = self.io.read32(0x00);
         }
         Err(EBUSY)
@@ -91,7 +134,7 @@ impl DwUart<'_> {
 
     fn transmit(&self, port: &mut LockedPort<'_>) {
         // TFNF is stronger than THRE: it also permits filling a partially full FIFO.
-        for _ in 0..FIFO_SIZE {
+        for _ in 0..self.fifo_size {
             if self.io.read32(0x7c) & 0x02 == 0 {
                 break;
             }
@@ -102,6 +145,24 @@ impl DwUart<'_> {
             self.io.write32(u32::from(byte), 0x00);
         }
         port.wake_writers();
+    }
+
+    /// Drains the receive FIFO within `budget` and reports whether it read anything.
+    fn receive(&self, port: &mut LockedPort<'_>, budget: &mut usize) -> bool {
+        let mut lsr = self.io.read32(0x14) | self.saved_lsr.xchg(0, Relaxed);
+        let mut received = false;
+        while lsr & LSR_DATA != 0 && *budget > 0 {
+            *budget -= 1;
+            let byte = if lsr & 0x01 != 0 {
+                self.io.read32(0x00) as u8
+            } else {
+                0
+            };
+            port.receive(byte, config::receive_status(lsr));
+            received = true;
+            lsr = self.io.read32(0x14);
+        }
+        received
     }
 }
 
@@ -117,8 +178,9 @@ impl Hardware for DwUart<'_> {
 
     fn startup(&self) -> Result {
         self.set_ier(0);
-        self.io.write32(0x07, 0x08);
-        let _ = self.lsr();
+        self.io.write32(FCR_RESET_ALL, 0x08);
+        let _ = self.io.read32(0x14);
+        self.saved_lsr.store(0, Relaxed);
         let _ = self.io.read32(0x00);
         let _ = self.io.read32(0x08);
         let _ = self.io.read32(0x18);
@@ -129,7 +191,7 @@ impl Hardware for DwUart<'_> {
     fn shutdown(&self) {
         self.set_ier(0);
         let _ = self.write_lcr(self.lcr() & !0x40);
-        self.io.write32(0x07, 0x08);
+        self.io.write32(FCR_RESET_ALL, 0x08);
     }
 
     fn start_tx(&self, port: &mut LockedPort<'_>) {
@@ -142,7 +204,7 @@ impl Hardware for DwUart<'_> {
     }
     fn flush_tx(&self) {
         self.stop_tx();
-        self.io.write32(0x05, 0x08); // Keep RX FIFO; clear the TX FIFO only.
+        self.io.write32(FCR_RESET_TX, 0x08); // Keep RX FIFO; clear the TX FIFO only.
     }
     fn stop_rx(&self) {
         self.set_ier(self.ier() & !(IER_RX | IER_LSR));
@@ -155,6 +217,17 @@ impl Hardware for DwUart<'_> {
             self.lcr() & !0x40
         };
         let _ = self.write_lcr(value);
+    }
+
+    fn prepare_clock(&self, baud: u32, clock: u32) -> u32 {
+        // Standard rates keep the 24 MHz reference. Others are synthesized by
+        // the CRU at sixteen times the baud rate, as 8250_dw does; if that
+        // fails the divisor check in configure() rejects the rate cleanly.
+        let wanted = hertz(config::baud_clock(REFERENCE_RATE, baud, self.dlf_bits));
+        if self.baud_clock.rate() != wanted {
+            let _ = self.baud_clock.set_rate(wanted);
+        }
+        u32::try_from(self.baud_clock.rate().as_hz()).unwrap_or(clock)
     }
 
     fn configure(&self, line: LineConfig) -> Result<u32> {
@@ -190,7 +263,7 @@ impl Hardware for DwUart<'_> {
             self.set_ier(ier);
             return Err(err);
         }
-        self.io.write32(0x01, 0x08); // FIFO enabled, lowest RX trigger for latency.
+        self.io.write32(FCR_ENABLE, 0x08);
         self.set_ier(ier);
         Ok(divisor.actual_baud)
     }
@@ -198,7 +271,12 @@ impl Hardware for DwUart<'_> {
     fn interrupt(&self, port: &mut LockedPort<'_>) -> bool {
         let mut handled = false;
         let mut received = false;
-        for _ in 0..IRQ_BUDGET {
+        // One budget bounds IIR iterations and received bytes together, so an
+        // RX flood cannot create an unbounded hard-IRQ loop. The level-
+        // triggered IRQ simply fires again for whatever is left.
+        let mut budget = IRQ_BUDGET;
+        while budget > 0 {
+            budget -= 1;
             let id = self.io.read32(0x08) & 0x0f;
             if id == 1 {
                 break;
@@ -207,16 +285,7 @@ impl Hardware for DwUart<'_> {
             match id {
                 2 => self.transmit(port),
                 4 | 6 | 12 => {
-                    // Drain one byte per iteration so an RX flood cannot create
-                    // an unbounded hard-IRQ loop. Level-triggered IRQ retriggers.
-                    let lsr = self.lsr();
-                    if lsr & 0x11 != 0 {
-                        let byte = if lsr & 1 != 0 {
-                            self.io.read32(0x00) as u8
-                        } else {
-                            0
-                        };
-                        port.receive(byte, config::receive_status(lsr));
+                    if self.receive(port, &mut budget) {
                         received = true;
                     } else if id == 12 {
                         // DW spurious receive-timeout quirk: dummy RBR clears it.
@@ -243,7 +312,7 @@ struct RustDwUart;
 
 impl platform::Driver for RustDwUart {
     type IdInfo = ();
-    type Data<'bound> = serial::Registration<'bound, DwUart<'bound>>;
+    type Data<'bound> = serial::Port<'bound, DwUart<'bound>>;
 
     fn probe<'bound>(
         pdev: &'bound platform::Device<Core<'_>>,
@@ -261,7 +330,7 @@ impl platform::Driver for RustDwUart {
                 .iomap_sized::<0x100>()?;
             let bus = EnabledClock::new(Clk::get(dev, Some(c"apb_pclk"))?)?;
             let baud = Clk::get(dev, Some(c"baudclk"))?;
-            let baud = ExclusiveEnabledClk::new(baud, Hertz::from_mhz(24))?;
+            let baud = ExclusiveEnabledClk::new(baud, hertz(REFERENCE_RATE))?;
             let rate = u32::try_from(baud.rate().as_hz()).map_err(|_| EINVAL)?;
             if rate < 16 * 115200 {
                 return Err(EINVAL);
@@ -270,7 +339,9 @@ impl platform::Driver for RustDwUart {
             let mut hardware = DwUart {
                 io,
                 dlf_bits: 0,
-                _baud_clock: baud,
+                fifo_size: FIFO_SIZE,
+                saved_lsr: Atomic::new(0),
+                baud_clock: baud,
                 _bus_clock: bus,
             };
             hardware.write_lcr(3)?;
@@ -287,29 +358,58 @@ impl platform::Driver for RustDwUart {
             }
             hardware.dlf_bits = bits;
             let depth = ((hardware.io.read32(0xf4) >> 16) & 0xff) * 16;
-            let fifo_size = if depth == 0 { FIFO_SIZE } else { depth };
-            dev_info!(
-                dev,
-                "Rust UART controller: ttyRU0, clock {} Hz, FIFO {}, DLF bits {}\n",
-                rate,
-                fifo_size,
-                bits
-            );
-            Ok(serial::Registration::new(
+            if depth != 0 {
+                hardware.fifo_size = depth;
+            }
+            let fifo_size = hardware.fifo_size;
+            Ok(serial::Port::new(
+                &TTY_DRIVER,
                 dev,
                 pdev.irq_by_index(0)?,
                 hardware,
                 mapbase,
                 rate,
                 fifo_size,
-                &THIS_MODULE,
-            ))
+            )
+            .pin_chain(move |port| {
+                dev_info!(
+                    dev,
+                    "Rust UART controller: {}{}, clock {} Hz, FIFO {}, DLF bits {}\n",
+                    TTY_DRIVER.info().dev_name,
+                    port.line(),
+                    rate,
+                    fifo_size,
+                    bits
+                );
+                Ok(())
+            }))
         })
     }
 }
 
-kernel::module_platform_driver! {
-    type: RustDwUart,
+/// The TTY driver is registered first and torn down last, so that every
+/// device is unbound (and its line removed) while the driver still exists.
+#[pin_data]
+struct RustDwUartModule {
+    #[pin]
+    platform: driver::Registration<platform::Adapter<RustDwUart>>,
+    tty: serial::Registration,
+}
+
+impl kernel::InPlaceModule for RustDwUartModule {
+    fn init(module: &'static ThisModule) -> impl PinInit<Self, Error> {
+        try_pin_init!(Self {
+            tty: TTY_DRIVER.register(module)?,
+            platform <- driver::Registration::new(
+                <Self as kernel::ModuleMetadata>::NAME,
+                module,
+            ),
+        })
+    }
+}
+
+module! {
+    type: RustDwUartModule,
     name: "rust_dw_uart",
     authors: ["ATK Rust driver contributors"],
     description: "Rust RK3588 DesignWare UART controller (explicit binding)",

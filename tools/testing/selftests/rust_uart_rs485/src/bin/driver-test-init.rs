@@ -75,9 +75,26 @@ fn test() -> io::Result<()> {
         unload(c"rust_chardev")?;
         println!("QEMU cycle {cycle}: module lifecycle PASS");
     }
-    load("/rust_dw_uart.ko")?;
-    unload(c"rust_dw_uart")?;
-    println!("QEMU: UART module registration/unregistration PASS (no RK3588 hardware)");
+    for cycle in 0..3 {
+        load("/rust_dw_uart.ko")?;
+        // The TTY driver exists for the module's lifetime, before any UART is bound.
+        let drivers = fs::read_to_string("/proc/tty/drivers")?;
+        if !drivers
+            .lines()
+            .any(|line| line.starts_with("rust_dw_uart") && line.contains("/dev/ttyRU"))
+        {
+            return Err(io::Error::other(format!("TTY driver missing:\n{drivers}")));
+        }
+        let info = fs::read_to_string("/proc/tty/driver/rust_dw_uart")?;
+        if !info.starts_with("serinfo:") || info.lines().count() != 1 {
+            return Err(io::Error::other(format!("unexpected line list:\n{info}")));
+        }
+        unload(c"rust_dw_uart")?;
+        if fs::metadata("/proc/tty/driver/rust_dw_uart").is_ok() {
+            return Err(io::Error::other("TTY driver survived module removal"));
+        }
+        println!("QEMU cycle {cycle}: UART TTY driver lifecycle PASS (no RK3588 hardware)");
+    }
     Ok(())
 }
 

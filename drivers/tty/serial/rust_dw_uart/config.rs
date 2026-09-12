@@ -32,6 +32,16 @@ pub(crate) fn divisor(clock: u32, baud: u32, fraction_bits: u8) -> Option<Diviso
     })
 }
 
+/// Chooses the input clock for `baud`: the fixed reference whenever it divides
+/// well enough, otherwise sixteen times the baud rate for the CRU to synthesize.
+pub(crate) fn baud_clock(reference: u32, baud: u32, fraction_bits: u8) -> u32 {
+    if divisor(reference, baud, fraction_bits).is_some() {
+        reference
+    } else {
+        baud.saturating_mul(16)
+    }
+}
+
 pub(crate) fn line_control(bits: u8, two_stops: bool, parity: bool, odd: bool) -> u32 {
     u32::from(bits.saturating_sub(5).min(3))
         | (u32::from(two_stops) << 2)
@@ -64,6 +74,17 @@ mod tests {
         assert!(divisor(24_000_000, 0, 6).is_none());
         assert!(divisor(u32::MAX, 1, 16).is_none());
         assert!(divisor(24_000_000, 115200, 32).is_none());
+    }
+
+    #[test]
+    fn reference_clock_is_kept_when_it_divides_well() {
+        for rate in [9600, 57600, 115200, 1_500_000] {
+            assert_eq!(baud_clock(24_000_000, rate, 0), 24_000_000);
+        }
+        assert_eq!(baud_clock(24_000_000, 230_400, 0), 3_686_400);
+        assert_eq!(baud_clock(24_000_000, 921_600, 0), 14_745_600);
+        assert_eq!(baud_clock(24_000_000, 921_600, 6), 24_000_000);
+        assert_eq!(baud_clock(24_000_000, u32::MAX, 0), u32::MAX);
     }
 
     #[test]

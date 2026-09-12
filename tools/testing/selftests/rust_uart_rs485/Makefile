@@ -12,4 +12,4 @@ $(OUTPUT)/rs485-test: Cargo.toml Cargo.lock $(wildcard src/*.rs)
 	CARGO_TARGET_DIR=$(OUTPUT)/cargo $(CARGO) build --locked --release --bin rs485-test $(CARGO_FLAGS)
 	cp $(OUTPUT)/cargo/$(if $(CARGO_BUILD_TARGET),$(CARGO_BUILD_TARGET)/)release/rs485-test $@
 
-EXTRA_CLEAN := cargo
+EXTRA_CLEAN := $(OUTPUT)/cargo

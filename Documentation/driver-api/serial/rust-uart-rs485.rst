@@ -8,9 +8,20 @@ Architecture and scope
 
 ``rust_dw_uart`` is a UART **controller** driver. Its register accesses,
 interrupt dispatch, FIFO service, baud divisor/framing changes, and break
-control are implemented in Rust. It registers one ``ttyRU0`` line through
-the existing C serial core and TTY subsystem. It does not call the C 8250
+control are implemented in Rust. It registers a ``ttyRU`` TTY driver with
+the existing C serial core for the module's lifetime and adds one line per
+bound UART (``ttyRU0`` for the first). It does not call the C 8250
 controller's interrupt or register-access implementation.
+
+``rust/kernel/serial.rs`` separates the two lifetimes deliberately. A
+``serial::Driver`` lives in a ``static`` and owns the TTY major and the
+per-line state that open TTYs keep referring to until they are closed; a
+``serial::Port`` is created in ``probe`` and only adds/removes its line.
+Because serial core frees line state in ``uart_unregister_driver()``, the
+abstraction sets the TTY driver's owner to the module so an open line pins
+the module, and it leaks the TTY driver rather than unregistering it while
+lines still exist. Controller callbacks receive only the controller state,
+never a partially initialized registration object.
 
 ``rust_chardev`` is an independent miscellaneous character-device driver.
 It provides a bounded FIFO for learning and regression testing; it is not
@@ -23,15 +34,27 @@ to ``rust/kernel/serial.rs`` and the existing kernel abstractions.
 
 This is a local development implementation, not a claim of upstream
 acceptance or production qualification. Current controller support is
-RK3588, 32-bit MMIO with a register shift of two, a 24 MHz baud clock,
-interrupt-driven I/O, and one non-console port. Console integration, DMA,
-modem flow control, automatic runtime power management, and system suspend
-are outside its current scope. Do not suspend the system with this driver
-bound. The baud clock is enabled and rate-protected while bound.
-Fractional-divisor width and FIFO depth are discovered from the controller.
-Divisors are rounded with fractional carry, and baud rates with more than
-two percent quantization error are rejected by restoring the prior termios.
-The application checks the effective settings after configuring the TTY.
+RK3588, 32-bit MMIO with a register shift of two, interrupt-driven I/O, and
+up to ten non-console ports. Console integration, DMA, modem flow control,
+automatic runtime power management, and system suspend are outside its
+current scope. Do not suspend the system with this driver bound.
+
+The baud clock is enabled and rate-protected while bound. Standard rates
+run from the 24 MHz reference; for rates it cannot divide within tolerance
+(230400, 460800, 921600, custom rates) the driver asks the CRU for sixteen
+times the baud rate before reprogramming the divisor, gating the clock
+around the change as ``8250_dw`` does. Fractional-divisor width and FIFO
+depth are discovered from the controller. Divisors are rounded with
+fractional carry, and baud rates that still have more than two percent
+quantization error are rejected by restoring the prior termios and clock;
+a rejected initial configuration is logged. The application checks the
+effective settings after configuring the TTY.
+
+The receive FIFO triggers at a quarter of its depth and the interrupt
+handler drains it completely within a bounded budget; DesignWare's
+four-character receive timeout delivers shorter messages. Error bits read
+from LSR outside the receive path are preserved for the character they
+describe, as the 8250 driver does.
 
 Layout
 ------
@@ -97,10 +120,15 @@ linker when building on x86. ``Cargo.lock`` pins userspace dependencies.
 The application's MSRV is independent of the kernel's toolchain minimum.
 
 On the tested ATK board, the capability register reports a 64-byte FIFO
-and zero DLF bits. With this driver's fixed 24 MHz clock, internal loopback
-has been verified at 9600, 19200, 38400, 57600, 115200 and 1500000 baud.
-Rates such as 230400 require CRU clock-rate adaptation; the current driver
-rejects excessive divisor error instead of silently running at a wrong rate.
+and zero DLF bits. Internal loopback has been verified on the board at
+9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600 and 1500000
+baud; the CRU clock adaptation was observed switching ``sclk_uart3`` to
+3686400, 7372800 and 14745600 Hz for the three non-24 MHz rates. RS485
+round trips against a CH340 adapter pass at 115200, 230400 and 460800
+baud. At 921600 baud the RS485 link fails identically with this driver and
+with the C 8250 driver, so that is a limit of the board's transceiver path
+or the adapter, not of the controller driver. The driver still rejects
+excessive divisor error instead of silently running at a wrong rate.
 
 Explicit controller binding
 ---------------------------
@@ -118,8 +146,9 @@ After deploying the new kernel, load and bind it explicitly::
 The helper is specific to ``feb60000.serial`` (UART3). It rejects a console
 UART, checks for open device files using ``fuser`` (psmisc), preserves an
 existing override by refusing to replace it, and rolls back a failed bind.
-The resulting node is ``/dev/ttyRU0``; ``/dev/ttyS3`` belongs to the former
-8250 driver and must not be used concurrently.
+The resulting node is ``/dev/ttyRU0`` (lines are handed out lowest-free
+first, so the first bound UART is line 0); ``/dev/ttyS3`` belongs to the
+former 8250 driver and must not be used concurrently.
 
 After closing the UART application, restore the default controller::
 
@@ -181,10 +210,14 @@ Holding a file open pins the module. This is why the miscellaneous-device
 abstraction now requires an owning module and offers a stream-open option
 and poll callback.
 
-UART module removal has different semantics: serial core hangs up active
-TTY files and revokes controller access. The hardware test verified HUP,
-EOF/EIO on read and EIO on write after removal, followed by successful
-module reload. An open UART file need not prevent low-level module removal.
+UART device *unbinding* has different semantics: serial core hangs up
+active TTY files and revokes controller access, so readers see HUP and
+EOF/EIO and writers see EIO, while the line state stays owned by the
+module-lifetime TTY driver until the file is closed. UART *module removal*
+behaves like the character device: an open ``ttyRU`` file holds a module
+reference and ``rmmod`` fails with EBUSY until it is closed. Earlier builds
+allowed removal with an open file, which freed line state that the TTY
+still referenced; that was a use-after-free, not a feature.
 
 The kselftest entry point is ``make run_tests`` from this test directory.
 UART tests are opt-in through ``RS485_DEVICE=/dev/ttyRU0`` after starting

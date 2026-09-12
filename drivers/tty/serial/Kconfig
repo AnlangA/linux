@@ -22,11 +22,14 @@ config SERIAL_RUST_DW
 	tristate "Rust RK3588 DesignWare UART controller"
 	depends on RUST && ARM64 && ARCH_ROCKCHIP && COMMON_CLK
 	depends on SERIAL_CORE=y
+	depends on DMA_ENGINE=y
 	help
-	  Interrupt-driven UART controller written in Rust. Uses serial core to
-	  expose /dev/ttyRU<n>, one line per bound UART. Intended for development
-	  on non-console RK3588 UARTs selected explicitly through driver_override;
-	  no console, DMA, modem flow control, or suspend support.
+	  UART controller written in Rust with PL330 DMA and interrupt PIO
+	  fallback. Uses serial core to expose /dev/ttyRU<n>, one line per bound
+	  UART. Intended for development on non-console RK3588 UARTs selected
+	  explicitly through driver_override;
+	  no console, modem flow control, or suspend support. DMA is enabled by
+	  default; use the dma=0 module parameter to select PIO explicitly.
 
 config SERIAL_AMBA_PL010
 	tristate "ARM AMBA PL010 serial port support"

@@ -34,6 +34,8 @@ use core::{
     ptr, //
 };
 
+pub mod dma;
+
 /// Error flags accepted by [`LockedPort::receive`].
 pub mod receive {
     /// Hardware receive overrun.
@@ -68,6 +70,13 @@ pub struct LineConfig {
 ///
 /// Methods must not sleep. IRQ service must have a bounded work budget.
 pub trait Hardware: Send + Sync {
+    /// Optional slave-DMA settings. Missing/unsupported channels fall back to PIO.
+    fn dma_config(&self) -> Option<dma::Config> {
+        None
+    }
+    /// Drains a hardware RX tail after DMA has been paused and synchronized.
+    /// Called under the UART lock, with no DMA accessing the RX FIFO.
+    fn drain_rx(&self, _port: &mut LockedPort<'_>) {}
     /// True only after both FIFO and shift register have drained.
     fn tx_empty(&self) -> bool;
     /// Sets outputs; only internal loopback is exposed by this initial API.
@@ -108,6 +117,86 @@ pub struct LockedPort<'a> {
 }
 
 impl LockedPort<'_> {
+    fn dma(&self) -> &dma::StateMachine {
+        // SAFETY: Rust ports point private_data at Context<T>, whose repr(C)
+        // first field is the fully initialized, pinned DMA state machine.
+        unsafe { &*(*self.raw).private_data.cast::<dma::StateMachine>() }
+    }
+
+    /// Attempts TX DMA; true means the DMA owns the transmit path for now.
+    pub fn dma_tx(&mut self) -> bool {
+        let dma = ptr::from_ref(self.dma());
+        // SAFETY: The LockedPort lifetime proves the live state/port lock.
+        unsafe { (*dma).tx_start(self) }
+    }
+
+    /// Attempts RX DMA; true means PIO must not consume the hardware FIFO.
+    pub fn dma_rx(&mut self) -> bool {
+        // SAFETY: The port lock protects the state machine and its resources.
+        unsafe { self.dma().rx_start() }
+    }
+
+    /// Pauses RX DMA and delivers its prefix. True permits PIO tail handling.
+    pub fn dma_rx_flush(&mut self) -> bool {
+        let dma = ptr::from_ref(self.dma());
+        // SAFETY: The caller holds the port lock and receive state is live.
+        unsafe { (*dma).rx_flush(self, true) }
+    }
+
+    /// Flushes DMA on a line-status error and selects PIO until the next open.
+    pub fn dma_rx_error(&mut self) -> bool {
+        let dma = ptr::from_ref(self.dma());
+        // SAFETY: The LockedPort proves a live port with its IRQ-safe lock held.
+        unsafe { (*dma).rx_error(self) }
+    }
+
+    fn tx_priority(&self) -> bool {
+        // SAFETY: Serial core's port lock protects x_char.
+        unsafe { (*self.raw).x_char != 0 }
+    }
+    fn tx_stopped(&self) -> bool {
+        // SAFETY: The transmit state is live under the port lock.
+        unsafe { bindings::uart_tx_stopped(self.raw) != 0 }
+    }
+    fn tx_pending(&self) -> usize {
+        // SAFETY: The transmit state is live under the port lock.
+        unsafe { bindings::uart_xmit_pending(self.raw) as usize }
+    }
+    fn peek_tx(&self, buffer: &mut [u8]) -> usize {
+        // SAFETY: The port lock protects the FIFO; buffer is writable and bounded.
+        unsafe {
+            bindings::uart_fifo_peek(self.raw, buffer.as_mut_ptr(), buffer.len() as u32) as usize
+        }
+    }
+    fn advance_tx(&mut self, count: usize) {
+        let count = count.min(self.tx_pending()) as u32;
+        // SAFETY: DMA completion owns these queued bytes. A flush changes phase
+        // before any completion can advance a reset FIFO; additionally bounded.
+        unsafe { bindings::uart_xmit_advance(self.raw, count) };
+    }
+    fn receive_dma(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        // SAFETY: The caller supplies a completed/paused DMA prefix, and the
+        // serial-core state is live and protected by the UART port lock.
+        unsafe {
+            (*self.raw).icount.rx = (*self.raw).icount.rx.wrapping_add(bytes.len() as u32);
+            if (*self.raw).ignore_status_mask & receive::DATA != 0 {
+                return;
+            }
+            let copied = bindings::tty_insert_flip_string(
+                ptr::addr_of_mut!((*(*self.raw).state).port),
+                bytes.as_ptr(),
+                bytes.len(),
+            );
+            (*self.raw).icount.buf_overrun = (*self.raw)
+                .icount
+                .buf_overrun
+                .wrapping_add(bytes.len().saturating_sub(copied.max(0) as usize) as u32);
+        }
+        self.push_rx();
+    }
     /// Pops an XON/XOFF byte first, then an ordinary queued byte.
     pub fn next_tx(&mut self) -> Option<u8> {
         // SAFETY: The callback contract guarantees a locked port and live state.
@@ -207,6 +296,7 @@ pub struct Driver {
     lines: Atomic<u64>,
     /// One of [`Self::UNREGISTERED`], [`Self::REGISTERING`] or [`Self::REGISTERED`].
     state: Atomic<u32>,
+    dma_stats: dma::Stats,
 }
 
 // SAFETY: `raw` is only mutated by `register()` and `Registration::drop()`,
@@ -229,6 +319,7 @@ impl Driver {
             info,
             lines: Atomic::new(0),
             state: Atomic::new(Self::UNREGISTERED),
+            dma_stats: dma::Stats::new(),
         }
     }
 
@@ -272,6 +363,11 @@ impl Driver {
     /// The static description this driver was created with.
     pub fn info(&self) -> &DriverInfo {
         &self.info
+    }
+
+    /// Aggregated DMA counters for this driver's registered ports.
+    pub fn dma_stats(&'static self) -> &'static dma::Stats {
+        &self.dma_stats
     }
 }
 
@@ -346,17 +442,29 @@ impl Drop for Line {
 /// # Invariants
 ///
 /// While `added` is set the port is registered with serial core and
-/// `raw.private_data` points at `hardware`. `hardware` and the parent device
-/// outlive all callbacks; removal stops IRQs synchronously.
+/// `raw.private_data` points at the initialized `context`. Context and the
+/// parent device outlive all callbacks; removal stops UART IRQs, DMA callbacks,
+/// and work synchronously before retiring the port.
 #[pin_data(PinnedDrop)]
 pub struct Port<'a, T: Hardware> {
     #[pin]
-    hardware: T,
+    context: Context<T>,
     line: Line,
     #[pin]
     raw: Opaque<bindings::uart_port>,
     _device: PhantomData<&'a Device<Bound>>,
     added: bool,
+}
+
+/// All callback-visible data is initialized before private_data is published.
+/// The first field is intentionally type-independent for LockedPort access.
+#[repr(C)]
+#[pin_data]
+struct Context<T> {
+    #[pin]
+    dma: dma::StateMachine,
+    #[pin]
+    hardware: T,
 }
 
 // SAFETY: Hardware is Send + Sync. All mutable uart_port accesses are protected
@@ -387,7 +495,17 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
             let line = Line::allocate(driver)?;
             let index = line.index;
             Ok(try_pin_init!(&this in Self {
-                hardware,
+                context <- {
+                    let config = hardware.dma_config();
+                    // SAFETY: This projects the future opaque UART slot's address
+                    // without reading it. No callback runs until the slot is initialized.
+                    let raw = unsafe { ptr::addr_of_mut!((*this.as_ptr()).raw).cast() };
+                    try_pin_init!(Context {
+                        dma <- dma::StateMachine::new(dev, config, driver.dma_stats(), raw,
+                            dma::Callbacks { tx: Self::dma_tx_complete, rx: Self::dma_rx_complete, work: Self::dma_work }),
+                        hardware,
+                    })
+                },
                 line,
                 raw <- Opaque::try_ffi_init(|slot: *mut bindings::uart_port| {
                     // SAFETY: The initializer owns the slot. `hardware` was
@@ -412,7 +530,7 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
                         (*slot).flags = bindings::UPF_FIXED_PORT | bindings::UPF_FIXED_TYPE;
                         (*slot).ops = &Self::OPS;
                         (*slot).private_data =
-                            ptr::addr_of!((*this.as_ptr()).hardware).cast_mut().cast();
+                            ptr::addr_of!((*this.as_ptr()).context).cast_mut().cast();
                     }
                     Ok::<(), Error>(())
                 }),
@@ -434,13 +552,25 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
         self.line.index
     }
 
+    /// Whether both firmware DMA channels and their buffers were acquired.
+    pub fn dma_enabled(&self) -> bool {
+        self.context.dma.available()
+    }
+
+    /// # Safety
+    /// The port must belong to this T and its context must remain live for `'b`.
+    unsafe fn context<'b>(port: *mut bindings::uart_port) -> &'b Context<T> {
+        // SAFETY: Only called with the live port created for this exact T.
+        unsafe { &*(*port).private_data.cast::<Context<T>>() }
+    }
+
     /// # Safety
     ///
     /// `port` must have been created by [`Port::new`] with this `T`, and that
     /// port must stay registered for the entire returned borrow `'b`.
     unsafe fn hardware<'b>(port: *mut bindings::uart_port) -> &'b T {
         // SAFETY: `private_data` points at the pinned `hardware` of a live port.
-        unsafe { &*(*port).private_data.cast::<T>() }
+        unsafe { &Self::context(port).hardware }
     }
 
     fn locked<R>(port: *mut bindings::uart_port, f: impl FnOnce(&mut LockedPort<'_>) -> R) -> R {
@@ -462,8 +592,9 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
     unsafe extern "C" fn tx_empty(port: *mut bindings::uart_port) -> u32 {
         // SAFETY: serial core only invokes callbacks while the port is registered.
         let hardware = unsafe { Self::hardware(port) };
-        Self::locked(port, |_| {
-            if hardware.tx_empty() {
+        Self::locked(port, |locked| {
+            // SAFETY: The lock protects the DMA ownership check.
+            if !unsafe { locked.dma().tx_busy() } && hardware.tx_empty() {
                 bindings::TIOCSER_TEMT
             } else {
                 0
@@ -507,6 +638,8 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
     ///
     /// `port` belongs to a live port and its IRQ-safe lock is held.
     unsafe extern "C" fn flush_buffer(port: *mut bindings::uart_port) {
+        // SAFETY: Serial core holds the port lock and has reset its TX FIFO.
+        unsafe { Self::context(port).dma.tx_flush() };
         // SAFETY: Serial core invokes this with the live port locked.
         unsafe { Self::hardware(port) }.flush_tx();
     }
@@ -515,6 +648,13 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
     ///
     /// `port` belongs to a live port and its IRQ-safe lock is held.
     unsafe extern "C" fn stop_rx(port: *mut bindings::uart_port) {
+        // SAFETY: Serial core holds the lock and state is still live.
+        unsafe {
+            Self::context(port).dma.stop_receive(&mut LockedPort {
+                raw: port,
+                _lifetime: PhantomData,
+            })
+        };
         // SAFETY: serial core supplies the port lock.
         unsafe { Self::hardware(port) }.stop_rx();
     }
@@ -550,9 +690,19 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
         if result < 0 {
             return result;
         }
-        if let Err(err) = Self::locked(port, |_| hardware.startup()) {
+        if let Err(err) = Self::locked(port, |locked| {
+            // SAFETY: The prior close synchronized work and callbacks.
+            unsafe { locked.dma().activate() };
+            hardware.startup()
+        }) {
+            Self::locked(port, |locked| {
+                // SAFETY: Startup failure still owns the live port and lock.
+                unsafe { locked.dma().deactivate() };
+            });
             // SAFETY: Balances request_irq; startup has not been published.
             unsafe { bindings::free_irq((*port).irq, port.cast()) };
+            // SAFETY: The context is live and IRQ handling has stopped.
+            unsafe { Self::context(port) }.dma.close();
             return err.to_errno();
         }
         0
@@ -565,10 +715,73 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
     unsafe extern "C" fn shutdown(port: *mut bindings::uart_port) {
         // SAFETY: serial core invokes shutdown once for each successful startup.
         let hardware = unsafe { Self::hardware(port) };
-        Self::locked(port, |_| hardware.shutdown());
+        Self::locked(port, |locked| {
+            // SAFETY: Serialized with all callbacks and worker requeues.
+            unsafe { locked.dma().deactivate() };
+            hardware.stop_rx();
+            hardware.stop_tx();
+        });
         // SAFETY: Hardware sources are now masked. free_irq waits for an in-flight
         // handler before serial core is allowed to destroy the port state.
         unsafe { bindings::free_irq((*port).irq, port.cast()) };
+        // SAFETY: Context stays pinned until shutdown and device removal finish.
+        unsafe { Self::context(port) }.dma.close();
+        Self::locked(port, |_| hardware.shutdown());
+    }
+
+    /// # Safety
+    /// Cookie is the live port submitted to the TX channel by this instantiation.
+    unsafe extern "C" fn dma_tx_complete(cookie: *mut c_void) {
+        let port = cookie.cast();
+        // SAFETY: DMA close synchronizes this callback before port state retires.
+        let context = unsafe { Self::context(port) };
+        Self::locked(port, |locked| {
+            // SAFETY: Completion and the UART lock establish TX buffer ownership.
+            if unsafe { context.dma.tx_complete(locked) } {
+                context.hardware.start_tx(locked);
+            }
+        });
+    }
+
+    /// # Safety
+    /// Cookie is the live port submitted to the RX channel by this instantiation.
+    unsafe extern "C" fn dma_rx_complete(cookie: *mut c_void) {
+        let port = cookie.cast();
+        // SAFETY: DMA close synchronizes this callback before port state retires.
+        let context = unsafe { Self::context(port) };
+        Self::locked(port, |locked| {
+            // SAFETY: Completion returns ownership of the full RX buffer.
+            if unsafe { context.dma.rx_complete(locked) } {
+                context.hardware.interrupt(locked);
+            }
+        });
+    }
+
+    /// # Safety
+    /// Work belongs to the pinned context of this exact Port<T> instantiation.
+    unsafe extern "C" fn dma_work(work: *mut bindings::work_struct) {
+        // SAFETY: The pinned state machine owns the queued work and close waits for it.
+        let dma = unsafe { dma::StateMachine::from_work(work) };
+        let port = dma.port;
+        // SAFETY: Close cancels this work before destroying the context/port state.
+        let hardware = unsafe { Self::hardware(port) };
+        let (tx, rx) = Self::locked(port, |locked| {
+            // SAFETY: Work and LockedPort refer to the same live, locked context.
+            unsafe { dma.work_prepare(locked) }
+        });
+        dma.synchronize(tx, rx);
+        Self::locked(port, |locked| {
+            // SAFETY: The selected transfers/callbacks were synchronized outside the lock.
+            if unsafe { dma.work_finish(tx, rx) } {
+                if rx {
+                    hardware.drain_rx(locked);
+                }
+                if tx {
+                    hardware.start_tx(locked);
+                }
+                hardware.interrupt(locked);
+            }
+        });
     }
 
     /// # Safety
@@ -590,6 +803,56 @@ impl<'a, T: Hardware + 'a> Port<'a, T> {
     /// `port` is live, `new` is exclusively writable and `old` is null or
     /// readable. Serial core holds the TTY mutex, but not the UART spinlock.
     unsafe extern "C" fn set_termios(
+        port: *mut bindings::uart_port,
+        new: *mut bindings::ktermios,
+        old: *const bindings::ktermios,
+    ) {
+        // SAFETY: Serial core holds the TTY mutex, keeping context alive through
+        // this sleepable preparation. The UART spinlock is only held briefly.
+        let context = unsafe { Self::context(port) };
+        Self::locked(port, |locked| {
+            // SAFETY: The termios caller owns live state; LockedPort holds its lock.
+            unsafe { context.dma.configure_begin(locked) }
+        });
+        let mut drained = false;
+        for _ in 0..512 {
+            if !Self::locked(port, |_| {
+                // SAFETY: This predicate is read under the UART port lock.
+                unsafe { context.dma.tx_running() }
+            }) {
+                drained = true;
+                break;
+            }
+            if crate::current!().signal_pending() {
+                break;
+            }
+            crate::time::delay::fsleep(crate::time::Delta::from_millis(1));
+        }
+        if drained {
+            context.dma.configure_sync();
+            // SAFETY: This wrapper has the same pointer and locking contract.
+            unsafe { Self::apply_termios(port, new, old) };
+        } else {
+            // Leave a slow/incomplete transfer intact rather than lose bytes.
+            // SAFETY: Serial core supplies valid new/old termios pointers.
+            unsafe {
+                if !old.is_null() {
+                    *new = *old;
+                }
+            }
+        }
+        Self::locked(port, |locked| {
+            // SAFETY: After successful synchronization no old callback can run.
+            if unsafe { context.dma.configure_end(drained) } {
+                context.hardware.start_tx(locked);
+                context.hardware.interrupt(locked);
+            }
+        });
+    }
+
+    /// # Safety
+    /// Same pointers/TTY locking as set_termios, after DMA has been quiesced.
+    unsafe fn apply_termios(
         port: *mut bindings::uart_port,
         new: *mut bindings::ktermios,
         old: *const bindings::ktermios,

@@ -7,8 +7,9 @@ Architecture and scope
 ----------------------
 
 ``rust_dw_uart`` is a UART **controller** driver. Its register accesses,
-interrupt dispatch, FIFO service, baud divisor/framing changes, and break
-control are implemented in Rust. It registers a ``ttyRU`` TTY driver with
+interrupt dispatch, FIFO service, DMA transfer ownership, baud
+divisor/framing changes, and break control are implemented in Rust. It
+registers a ``ttyRU`` TTY driver with
 the existing C serial core for the module's lifetime and adds one line per
 bound UART (``ttyRU0`` for the first). It does not call the C 8250
 controller's interrupt or register-access implementation.
@@ -27,15 +28,18 @@ never a partially initialized registration object.
 It provides a bounded FIFO for learning and regression testing; it is not
 a wrapper around ``ttyRU0`` and does not access the RS485 hardware.
 
-The new C code consists only of wrappers for existing serial-core inline
-functions and macros that bindgen cannot expose directly. These live in
-``rust/helpers/serial.c``. Rust/C pointer and lifetime handling is confined
-to ``rust/kernel/serial.rs`` and the existing kernel abstractions.
+The serial core and DMAengine framework remain C. Thin C helpers expose
+their inline functions and macros to Rust. PL330 also gains a
+``device_synchronize`` operation to wait for completion callbacks after
+termination; stopping hardware alone does not wait for callbacks already
+dispatched by its tasklet. Rust/C pointer and lifetime handling is confined
+to the kernel abstractions.
 
 This is a local development implementation, not a claim of upstream
 acceptance or production qualification. Current controller support is
-RK3588, 32-bit MMIO with a register shift of two, interrupt-driven I/O, and
-up to ten non-console ports. Console integration, DMA, modem flow control,
+RK3588, 32-bit MMIO with a register shift of two, PL330 DMA with interrupt
+PIO fallback, and up to ten non-console ports. Console integration, modem
+flow control,
 automatic runtime power management, and system suspend are outside its
 current scope. Do not suspend the system with this driver bound.
 
@@ -62,7 +66,12 @@ Layout
 * ``drivers/tty/serial/rust_dw_uart.rs``: UART platform/controller driver.
 * ``drivers/tty/serial/rust_dw_uart/config.rs``: register encoding.
 * ``rust/kernel/serial.rs``: serial-core registration and locked port API.
+* ``rust/kernel/serial/dma.rs``: DMA transfer and cancellation state machine.
+* ``rust/kernel/serial/dma/state.rs``: completion bookkeeping shared by tests.
+* ``rust/kernel/dmaengine.rs``: private slave-channel and buffer ownership API.
 * ``rust/helpers/serial.c``: inline/macro compatibility wrappers.
+* ``rust/helpers/dmaengine.c``: DMAengine and workqueue inline helpers.
+* ``drivers/dma/pl330.c``: DMA provider, including callback synchronization.
 * ``drivers/misc/rust_chardev.rs``: character-device operations.
 * ``drivers/misc/rust_chardev/ring.rs``: bounded FIFO indices.
 * ``tools/testing/selftests/rust_uart_rs485/``: Rust test application,
@@ -94,7 +103,9 @@ Build
 -----
 
 Enable ``CONFIG_RUST=y``, ``CONFIG_SERIAL_CORE=y``,
+``CONFIG_DMA_ENGINE=y``, ``CONFIG_PL330_DMA=y``,
 ``CONFIG_SERIAL_RUST_DW=m``, ``CONFIG_RUST_CHARDEV=m`` and module unloading.
+Enable ``CONFIG_DEBUG_FS=y`` for DMA diagnostic counters.
 Follow ``Documentation/rust/quick-start.rst`` for the Rust, Clang, libclang,
 and bindgen requirements. Check ``make ARCH=arm64 LLVM=1 rustavailable``
 with the same compiler settings that will be used for the kernel.
@@ -153,6 +164,71 @@ former 8250 driver and must not be used concurrently.
 After closing the UART application, restore the default controller::
 
     tools/testing/selftests/rust_uart_rs485/bind-uart3.sh --restore
+
+DMA operation
+-------------
+
+DMA is enabled by default. The driver requests the existing firmware
+``tx`` and ``rx`` channels, configures one-byte peripheral accesses, and
+allocates coherent bounce buffers in the DMA provider's address domain.
+The RX burst matches the UART's quarter-FIFO trigger, capped at 16 bytes.
+This implementation accepts PL330 only: its synchronous pause, residue,
+non-failing termination and callback synchronization are required by the
+ownership model. An unavailable or unsuitable channel selects PIO for the
+port; a provider still probing defers the UART probe.
+
+TX copies at most 256 bytes from the TTY queue without advancing it. Only
+the completion callback advances the queue and wakes writers. A software
+stop allows the issued block to complete, then prevents chaining: PL330
+cannot resume a paused transfer. The stop latency therefore depends on
+the current baud rate and includes bytes already in the UART FIFO.
+``tx_empty`` includes DMA state and UART TEMT so a drain waits for actual
+transmission. A transmit flush discards the pending queue advancement
+before cancelling DMA; a late callback cannot consume newly queued bytes.
+
+RX uses a 512-byte buffer. Full completions insert the block into the TTY
+flip buffer. A UART receive timeout pauses DMA, reads its stable residue,
+delivers the received prefix, and drains the remaining FIFO using PIO.
+A 20 ms delayed-work timer also flushes short packets whose last DMA
+burst emptied the FIFO and therefore generated no UART timeout. This is
+a scheduling interval, not a hard latency guarantee. Tiny packets and
+FIFO tails can use PIO even with DMA enabled. A line-status error selects
+RX PIO for the rest of that open session; DMA has no per-byte error data.
+
+All state transitions hold the UART port lock. Cancelled buffers remain
+unavailable until a process-context worker synchronizes the old callback.
+Coherent allocation removes explicit cache maintenance, but DMA write/read
+barriers still order buffer ownership transfers. Close disables requeueing,
+stops interrupts, cancels the worker and synchronizes both channels before
+serial core retires its port state. Termios changes prevent new submissions
+and quiesce DMA before changing the clock and framing; an interrupted or
+overlong TX wait retains the previous settings. Applications should use
+``TCSADRAIN`` when bytes already on the wire must retain the old framing.
+
+With debugfs mounted, inspect diagnostic counters as root::
+
+    cat /sys/kernel/debug/rust_dw_uart/dma
+
+``dma_ports`` counts bound ports with both channels. ``tx_dma_bytes`` and
+``rx_dma_bytes`` count completed or flushed DMA payload bytes, excluding
+PIO tails. ``tx_dma_blocks`` and ``rx_dma_blocks`` count submissions;
+``rx_dma_flushes`` counts partial/timeout cancellation paths and
+``tx_dma_flushes`` counts explicit transmit cancellations. ``pio_fallbacks``
+counts unsuccessful channel setup attempts, while ``dma_errors`` counts
+runtime DMA failures and receive line-status errors. Counters are
+module-wide and reset on module reload; a concurrent snapshot is not
+atomic across fields. This debugfs text is diagnostic, not a stable ABI.
+
+To compare PIO, close applications, stop any automatic binding service,
+restore the C controller with the binding helper, then reload::
+
+    modprobe -r rust_dw_uart
+    modprobe rust_dw_uart dma=0
+    tools/testing/selftests/rust_uart_rs485/bind-uart3.sh --rust
+
+Repeat the restore/unload/load/bind sequence without ``dma=0`` to return
+to DMA. Loading the module again while it is already loaded does not
+change this parameter. Restart the binding service if one is installed.
 
 Controller tests
 ----------------
@@ -226,18 +302,25 @@ the peer. Missing devices produce kselftest SKIP, not a false PASS.
 Validation boundaries
 ---------------------
 
-Host tests validate the exact shared ring/register-encoding source, CRC,
+Host tests validate the exact shared ring/register-encoding source, DMA
+completion/cancellation bookkeeping, CRC,
 malformed frames, and PTY fragmentation/deadlines/disconnection. QEMU can
 exercise the actual ARM64 character module, user faults, and repeated
 module load/unload, including rejection of unload with an open file.
 QEMU virt does not emulate the RK3588 UART; physical controller and RS485
-tests must be recorded separately on the board. Compile/PTY/QEMU success
+tests must be recorded separately on the board. DMA validation additionally
+requires nonzero TX/RX counters, full RX completions and short-message
+timeouts, cancellation while active, device unbind/rebind, live termios
+changes, software stop/start and explicit PIO comparison. QEMU virt does
+not test the RK3588 PL330 channels. Compile/PTY/QEMU success
 must not be presented as proof of board-level UART operation.
 
 Community references
 --------------------
 
 * ``Documentation/driver-api/serial/driver.rst`` (serial core / uart_ops).
+* ``Documentation/driver-api/dmaengine/client.rst`` (DMAengine client lifecycle).
+* ``Documentation/core-api/dma-api-howto.rst`` (DMA address domains and ordering).
 * ``Documentation/driver-api/misc_devices.rst`` (miscellaneous devices).
 * ``Documentation/rust/general-information.rst`` (abstractions vs bindings).
 * ``Documentation/rust/coding-guidelines.rst`` (Rust style and safety comments).

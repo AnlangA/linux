@@ -64,6 +64,8 @@ pub mod device;
 pub mod device_id;
 pub mod devres;
 pub mod dma;
+#[cfg(CONFIG_DMA_ENGINE = "y")]
+pub mod dmaengine;
 pub mod driver;
 #[cfg(CONFIG_DRM = "y")]
 pub mod drm;
@@ -118,7 +120,7 @@ pub mod revocable;
 pub mod safety;
 pub mod scatterlist;
 pub mod security;
-#[cfg(CONFIG_SERIAL_CORE = "y")]
+#[cfg(all(CONFIG_SERIAL_CORE = "y", CONFIG_DMA_ENGINE = "y"))]
 pub mod serial;
 pub mod seq_file;
 pub mod sizes;

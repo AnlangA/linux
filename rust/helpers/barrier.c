@@ -16,3 +16,13 @@ __rust_helper void rust_helper_smp_rmb(void)
 {
 	smp_rmb();
 }
+
+__rust_helper void rust_helper_dma_wmb(void)
+{
+	dma_wmb();
+}
+
+__rust_helper void rust_helper_dma_rmb(void)
+{
+	dma_rmb();
+}

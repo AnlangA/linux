@@ -15,6 +15,7 @@ use kernel::{
         ExclusiveEnabledClk,
         Hertz, //
     },
+    debugfs,
     device::Core,
     driver,
     io::{
@@ -49,7 +50,7 @@ const IER_TX: u32 = 2;
 const IER_LSR: u32 = 4;
 /// FIFOs enabled with the receive trigger at a quarter depth; DesignWare's
 /// four-character timeout interrupt still delivers shorter messages promptly.
-const FCR_ENABLE: u32 = 0x41;
+const FCR_ENABLE: u32 = 0x49;
 const FCR_RESET_ALL: u32 = FCR_ENABLE | 0x06;
 const FCR_RESET_TX: u32 = FCR_ENABLE | 0x04;
 /// LSR overrun, parity, framing and break bits.
@@ -86,6 +87,7 @@ impl Drop for EnabledClock {
 
 /// All register accesses are serialized by serial core's UART port spinlock.
 struct DwUart<'a> {
+    dma: Option<serial::dma::Config>,
     io: IoMem<'a, 0x100>,
     dlf_bits: u8,
     fifo_size: u32,
@@ -167,6 +169,17 @@ impl DwUart<'_> {
 }
 
 impl Hardware for DwUart<'_> {
+    fn dma_config(&self) -> Option<serial::dma::Config> {
+        self.dma
+    }
+
+    fn drain_rx(&self, port: &mut LockedPort<'_>) {
+        let mut budget = IRQ_BUDGET;
+        if self.receive(port, &mut budget) {
+            port.push_rx();
+        }
+    }
+
     fn tx_empty(&self) -> bool {
         self.lsr() & 0x40 != 0
     }
@@ -195,6 +208,10 @@ impl Hardware for DwUart<'_> {
     }
 
     fn start_tx(&self, port: &mut LockedPort<'_>) {
+        if port.dma_tx() {
+            self.stop_tx();
+            return;
+        }
         self.set_ier(self.ier() | IER_TX);
         self.transmit(port);
     }
@@ -283,8 +300,15 @@ impl Hardware for DwUart<'_> {
             }
             handled = true;
             match id {
-                2 => self.transmit(port),
+                2 => self.start_tx(port),
+                4 if port.dma_rx() => break,
                 4 | 6 | 12 => {
+                    if id == 6 && !port.dma_rx_error() {
+                        break;
+                    }
+                    if id == 12 && !port.dma_rx_flush() {
+                        break;
+                    }
                     if self.receive(port, &mut budget) {
                         received = true;
                     } else if id == 12 {
@@ -337,6 +361,7 @@ impl platform::Driver for RustDwUart {
             }
             // Ensure the old driver did not leave DLAB selected before masking IRQs.
             let mut hardware = DwUart {
+                dma: None,
                 io,
                 dlf_bits: 0,
                 fifo_size: FIFO_SIZE,
@@ -362,6 +387,12 @@ impl platform::Driver for RustDwUart {
                 hardware.fifo_size = depth;
             }
             let fifo_size = hardware.fifo_size;
+            if *module_parameters::dma.value() != 0 {
+                hardware.dma = Some(serial::dma::Config {
+                    fifo: mapbase,
+                    burst: (fifo_size / 4).clamp(1, 16),
+                });
+            }
             Ok(serial::Port::new(
                 &TTY_DRIVER,
                 dev,
@@ -374,12 +405,13 @@ impl platform::Driver for RustDwUart {
             .pin_chain(move |port| {
                 dev_info!(
                     dev,
-                    "Rust UART controller: {}{}, clock {} Hz, FIFO {}, DLF bits {}\n",
+                    "Rust UART controller: {}{}, clock {} Hz, FIFO {}, DLF bits {}, DMA {}\n",
                     TTY_DRIVER.info().dev_name,
                     port.line(),
                     rate,
                     fifo_size,
-                    bits
+                    bits,
+                    port.dma_enabled()
                 );
                 Ok(())
             }))
@@ -392,18 +424,25 @@ impl platform::Driver for RustDwUart {
 #[pin_data]
 struct RustDwUartModule {
     #[pin]
+    dma_stats: debugfs::File<&'static serial::dma::Stats>,
+    #[pin]
     platform: driver::Registration<platform::Adapter<RustDwUart>>,
     tty: serial::Registration,
+    debugfs: debugfs::Dir,
 }
 
 impl kernel::InPlaceModule for RustDwUartModule {
     fn init(module: &'static ThisModule) -> impl PinInit<Self, Error> {
+        let debugfs = debugfs::Dir::new(c"rust_dw_uart");
         try_pin_init!(Self {
             tty: TTY_DRIVER.register(module)?,
+            dma_stats <- debugfs.read_callback_file(c"dma", TTY_DRIVER.dma_stats(),
+                &|stats, f| stats.write(f)),
             platform <- driver::Registration::new(
                 <Self as kernel::ModuleMetadata>::NAME,
                 module,
             ),
+            debugfs,
         })
     }
 }
@@ -414,4 +453,10 @@ module! {
     authors: ["ATK Rust driver contributors"],
     description: "Rust RK3588 DesignWare UART controller (explicit binding)",
     license: "GPL v2",
+    params: {
+        dma: u32 {
+            default: 1,
+            description: "Use firmware DMA channels when available (0 selects PIO)",
+        },
+    },
 }

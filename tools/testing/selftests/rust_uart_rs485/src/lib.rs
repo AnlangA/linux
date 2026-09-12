@@ -264,6 +264,11 @@ pub fn deadline(timeout: Duration) -> io::Result<Instant> {
 #[cfg(test)]
 #[path = "../../../../../drivers/misc/rust_chardev/ring.rs"]
 mod ring_tests;
+
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../../../../../rust/kernel/serial/dma/state.rs"]
+mod dma_state_tests;
 #[cfg(test)]
 #[path = "../../../../../drivers/tty/serial/rust_dw_uart/config.rs"]
 mod uart_config_tests;

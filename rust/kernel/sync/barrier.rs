@@ -7,6 +7,20 @@
 //!
 //! [`LKMM`]: srctree/tools/memory-model/
 
+/// Orders CPU writes to coherent DMA memory before device ownership is published.
+#[inline(always)]
+pub fn dma_wmb() {
+    // SAFETY: The DMA memory barrier has no preconditions, including on UP.
+    unsafe { bindings::dma_wmb() };
+}
+
+/// Orders reads of coherent DMA memory after observing device completion.
+#[inline(always)]
+pub fn dma_rmb() {
+    // SAFETY: The DMA memory barrier has no preconditions, including on UP.
+    unsafe { bindings::dma_rmb() };
+}
+
 /// A compiler barrier.
 ///
 /// A barrier that prevents compiler from reordering memory accesses across the barrier.

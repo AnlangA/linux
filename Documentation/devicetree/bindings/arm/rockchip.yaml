@@ -36,6 +36,11 @@ properties:
               - 9tripod,x3568-v4
           - const: rockchip,rk3568
 
+      - description: Alientek ATK-DLRK3588
+        items:
+          - const: alientek,atk-dlrk3588
+          - const: rockchip,rk3588
+
       - description: Amarula Vyasa RK3288
         items:
           - const: amarula,vyasa-rk3288
